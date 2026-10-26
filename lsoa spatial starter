@@ -1,0 +1,283 @@
+"""
+LSOA spatial analysis starter (GeoPandas)
+-----------------------------------------
+Small portfolio project that mirrors the Imago/CLiVE task:
+points/lines -> spatial join to LSOAs -> per-LSOA metric -> map.
+
+Data (download manually, free):
+  1. LSOA 2021 boundaries (England & Wales), "BSC" generalised:
+     https://geoportal.statistics.gov.uk  -> search "LSOA 2021 Boundaries EW BSC" -> GeoPackage/GeoJSON
+  2. Any point dataset with coordinates, e.g. police.uk street crime CSV
+     (https://data.police.uk/data/) or NaPTAN bus stops.
+     Swap in coastal/shoreline data later if you find an open source.
+
+Run:
+  pip install geopandas pandas matplotlib mapclassify
+  python lsoa_spatial_starter.py --lsoa lsoa_2021.gpkg --points points.csv \
+         --lon Longitude --lat Latitude --region "Liverpool" --out results
+
+Exit codes:
+  0 success | 1 bad input / data error | 2 missing dependency | 3 output error
+"""
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+log = logging.getLogger("lsoa")
+
+BNG = "EPSG:27700"   # British National Grid: metres, correct for area/distance
+WGS84 = "EPSG:4326"  # lon/lat degrees (police.uk, NaPTAN, most CSVs)
+
+# Rough bounding box for England & Wales, used to catch swapped or garbage coordinates
+EW_LON = (-6.5, 2.0)
+EW_LAT = (49.8, 56.0)
+
+
+class DataError(Exception):
+    """Problem with the input data (exit code 1)."""
+
+
+class OutputError(Exception):
+    """Problem writing results (exit code 3)."""
+
+
+def import_deps():
+    """Import heavy libraries with a clear message if any are missing."""
+    try:
+        import geopandas as gpd
+        import pandas as pd
+    except ImportError as e:
+        log.error("Missing dependency: %s. Install with: pip install geopandas pandas", e.name)
+        sys.exit(2)
+    return gpd, pd
+
+
+def check_file(path_str, label, allowed_ext):
+    path = Path(path_str)
+    if not path.exists():
+        raise DataError(f"{label} file not found: {path}")
+    if not path.is_file():
+        raise DataError(f"{label} path is not a file: {path}")
+    if path.stat().st_size == 0:
+        raise DataError(f"{label} file is empty: {path}")
+    if path.suffix.lower() not in allowed_ext:
+        raise DataError(f"{label} file must be one of {sorted(allowed_ext)}, got '{path.suffix}'")
+    return path
+
+
+def find_column(columns, prefix, suffix, label):
+    """Find e.g. LSOA21CD / LSOA11NM regardless of year or case."""
+    matches = [c for c in columns if c.upper().startswith(prefix) and c.upper().endswith(suffix)]
+    if not matches:
+        raise DataError(
+            f"No LSOA {label} column (expected something like {prefix}21{suffix}). "
+            f"Columns found: {list(columns)}"
+        )
+    if len(matches) > 1:
+        log.warning("Several LSOA %s columns %s; using '%s'", label, matches, matches[0])
+    return matches[0]
+
+
+def load_lsoa(gpd, path, region):
+    try:
+        lsoa = gpd.read_file(path)
+    except Exception as e:  # fiona/pyogrio raise several different types
+        raise DataError(f"Could not read LSOA boundaries '{path}': {e}") from e
+
+    if lsoa.empty:
+        raise DataError(f"LSOA file '{path}' contains no features")
+    if lsoa.crs is None:
+        log.warning("LSOA file has no CRS; assuming British National Grid (%s)", BNG)
+        lsoa = lsoa.set_crs(BNG)
+
+    code_col = find_column(lsoa.columns, "LSOA", "CD", "code")
+    name_col = find_column(lsoa.columns, "LSOA", "NM", "name")
+
+    # Clean geometries
+    n0 = len(lsoa)
+    lsoa = lsoa[lsoa.geometry.notna() & ~lsoa.geometry.is_empty]
+    invalid = ~lsoa.geometry.is_valid
+    if invalid.any():
+        log.warning("Repairing %d invalid LSOA geometries with buffer(0)", int(invalid.sum()))
+        lsoa.loc[invalid, "geometry"] = lsoa.loc[invalid, "geometry"].buffer(0)
+    if len(lsoa) < n0:
+        log.warning("Dropped %d LSOAs with missing/empty geometry", n0 - len(lsoa))
+
+    if lsoa[code_col].duplicated().any():
+        dups = lsoa.loc[lsoa[code_col].duplicated(), code_col].unique()[:5]
+        log.warning("Duplicate LSOA codes (e.g. %s); dissolving them into one shape each", list(dups))
+        lsoa = lsoa.dissolve(by=code_col, aggfunc="first").reset_index()
+
+    if region:
+        lsoa = lsoa[lsoa[name_col].astype(str).str.contains(region, case=False, na=False, regex=False)]
+        if lsoa.empty:
+            raise DataError(f"No LSOAs match region '{region}'. Check spelling (e.g. 'Liverpool').")
+        log.info("Region filter '%s' kept %d LSOAs", region, len(lsoa))
+
+    try:
+        lsoa = lsoa.to_crs(BNG)
+    except Exception as e:
+        raise DataError(f"Could not reproject LSOAs to {BNG}: {e}") from e
+
+    return lsoa[[code_col, name_col, "geometry"]], code_col, name_col
+
+
+def load_points(gpd, pd, path, lon, lat):
+    try:
+        df = pd.read_csv(path, low_memory=False)
+    except pd.errors.EmptyDataError as e:
+        raise DataError(f"Points CSV '{path}' has no data") from e
+    except pd.errors.ParserError as e:
+        raise DataError(f"Points CSV '{path}' is malformed: {e}") from e
+    except UnicodeDecodeError:
+        log.warning("CSV is not UTF-8; retrying with latin-1 encoding")
+        df = pd.read_csv(path, low_memory=False, encoding="latin-1")
+
+    missing = [c for c in (lon, lat) if c not in df.columns]
+    if missing:
+        raise DataError(f"Column(s) {missing} not in points CSV. Available: {list(df.columns)}")
+
+    n0 = len(df)
+    # Non-numeric values (e.g. "N/A") become NaN, then are dropped
+    df[lon] = pd.to_numeric(df[lon], errors="coerce")
+    df[lat] = pd.to_numeric(df[lat], errors="coerce")
+    df = df.dropna(subset=[lon, lat])
+    dropped_nan = n0 - len(df)
+
+    in_box = df[lon].between(*EW_LON) & df[lat].between(*EW_LAT)
+    if not in_box.any():
+        swapped = df[lat].between(*EW_LON) & df[lon].between(*EW_LAT)
+        hint = " Looks like --lon and --lat are swapped." if swapped.mean() > 0.5 else ""
+        raise DataError("No points fall inside England & Wales." + hint)
+    dropped_box = int((~in_box).sum())
+    df = df[in_box]
+
+    n_before_dup = len(df)
+    df = df.drop_duplicates()
+    dropped_dup = n_before_dup - len(df)
+
+    log.info(
+        "Points: %d read | dropped %d missing/non-numeric coords, %d outside E&W, %d duplicates | %d kept",
+        n0, dropped_nan, dropped_box, dropped_dup, len(df),
+    )
+    if df.empty:
+        raise DataError("No valid points remain after cleaning")
+
+    return gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[lon], df[lat]), crs=WGS84).to_crs(BNG)
+
+
+def analyse(gpd, lsoa, pts, code_col):
+    joined = gpd.sjoin(pts, lsoa[[code_col, "geometry"]], how="inner", predicate="within")
+    if joined.empty:
+        raise DataError("Spatial join matched 0 points to LSOAs (wrong region filter or wrong CRS?)")
+
+    match_rate = len(joined) / len(pts)
+    log.info("Matched %d of %d points to an LSOA (%.1f%%)", len(joined), len(pts), 100 * match_rate)
+    if match_rate < 0.5:
+        log.warning("Under half the points matched; if you used --region, this may be expected")
+
+    counts = joined.groupby(code_col).size().rename("n_points")
+    out = lsoa.merge(counts, on=code_col, how="left")
+    out["n_points"] = out["n_points"].fillna(0).astype(int)
+    out["area_km2"] = out.geometry.area / 1e6
+    # Avoid division by zero for degenerate polygons
+    out["density_per_km2"] = out["n_points"].div(out["area_km2"].where(out["area_km2"] > 0))
+
+    # Validation checks: raise instead of assert (asserts vanish under python -O)
+    if not out[code_col].is_unique:
+        raise DataError("Duplicate LSOA codes in output")
+    if out["n_points"].sum() != len(joined):
+        raise DataError(
+            f"Aggregation mismatch: {out['n_points'].sum()} counted vs {len(joined)} joined "
+            "(points on shared boundaries may be double-counted)"
+        )
+    return out
+
+
+def write_outputs(out, out_dir):
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out.drop(columns="geometry").to_csv(out_dir / "lsoa_metrics.csv", index=False)
+        out.to_file(out_dir / "lsoa_metrics.gpkg", driver="GPKG")
+    except PermissionError as e:
+        raise OutputError(f"No permission to write to '{out_dir}': {e}") from e
+    except OSError as e:
+        raise OutputError(f"Could not write outputs to '{out_dir}': {e}") from e
+
+    # The map is optional: a plotting failure should not lose the data outputs
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # works without a display (servers, CI)
+        import matplotlib.pyplot as plt
+
+        kwargs = dict(column="density_per_km2", legend=True, cmap="viridis",
+                      figsize=(8, 8), edgecolor="none",
+                      missing_kwds={"color": "lightgrey"})
+        try:
+            import mapclassify  # noqa: F401
+            kwargs.update(scheme="quantiles", k=5)
+        except ImportError:
+            log.info("mapclassify not installed; using a continuous colour scale")
+
+        ax = out.plot(**kwargs)
+        ax.set_axis_off()
+        ax.set_title("Point density per LSOA (per km²)")
+        plt.savefig(out_dir / "lsoa_map.png", dpi=200, bbox_inches="tight")
+        plt.close()
+    except ImportError:
+        log.warning("matplotlib not installed; skipping map")
+    except Exception as e:
+        log.warning("Map could not be drawn (%s); CSV and GeoPackage were still written", e)
+
+    log.info("Outputs written to %s", out_dir.resolve())
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Aggregate point data to LSOAs and map it.")
+    ap.add_argument("--lsoa", required=True, help="LSOA boundaries (.gpkg, .geojson, .shp)")
+    ap.add_argument("--points", required=True, help="CSV with lon/lat columns")
+    ap.add_argument("--lon", default="Longitude")
+    ap.add_argument("--lat", default="Latitude")
+    ap.add_argument("--region", default=None, help="substring of LSOA name to filter, e.g. Liverpool")
+    ap.add_argument("--out", default="results", help="output folder")
+    ap.add_argument("-v", "--verbose", action="store_true", help="show full tracebacks")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)-7s %(message)s")
+    gpd, pd = import_deps()
+
+    try:
+        lsoa_path = check_file(args.lsoa, "LSOA", {".gpkg", ".geojson", ".json", ".shp", ".zip"})
+        pts_path = check_file(args.points, "Points", {".csv", ".txt"})
+
+        lsoa, code_col, _ = load_lsoa(gpd, lsoa_path, args.region)
+        pts = load_points(gpd, pd, pts_path, args.lon, args.lat)
+        out = analyse(gpd, lsoa, pts, code_col)
+
+        print(out[["n_points", "density_per_km2"]].describe().round(2))
+        write_outputs(out, Path(args.out))
+        return 0
+
+    except DataError as e:
+        log.error(e)
+        return 1
+    except OutputError as e:
+        log.error(e)
+        return 3
+    except KeyboardInterrupt:
+        log.error("Interrupted by user")
+        return 130
+    except Exception as e:  # last resort: unexpected bug
+        log.error("Unexpected error: %s: %s (re-run with -v for the full traceback)", type(e).__name__, e)
+        if args.verbose:
+            raise
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
